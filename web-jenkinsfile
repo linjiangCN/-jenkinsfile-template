@@ -1,0 +1,341 @@
+#!groovy
+
+@Library('jenkinslibrary@master') _
+
+//func from shareibrary
+def tools = new org.devops.tools()
+def publish = new org.devops.deploy()
+def sonar = new org.devops.sonarqubeWEB()
+def toemail = new org.devops.toemailWeb()
+
+
+//获取job项目名称
+jobName="${sonarName}".split("-")[0]
+
+//获取job工作目录
+job_workspace="/home/jenkins/workspace"
+
+
+//env
+String workspace = "${job_workspace}/${jobName}/${sonarName}"
+String buildType = "${env.buildType}"
+String buildShell = "${env.buildShell}"
+String srcUrl = "${env.srcUrl}"
+String branchName = "${env.branchName}"
+
+
+
+
+
+
+
+pipeline{
+    
+    agent { node {  label "jenkins-k8s-build"   //指定运行节点的标签或者名称
+                    customWorkspace "${workspace}"   //指定运行工作目录（可选）
+
+            }
+    }
+    
+
+   environment {
+       BUILD_USER_ID = ""
+       BUILD_USER = ""
+       BUILD_USER_EMAIL = ""
+       //docker build TAG
+       imageTag= sh returnStdout: true ,script: "date +%Y%m%d%H%M%S"
+       //阈值变量
+       QA_http_url='http://sonarqube-service:9000/api'
+       QA_name="${sonarName}"
+       bugs_Value=0
+       smells_Value=0
+       vulnerabilities_Value=0
+       duplicated_Value=0
+
+       //报告地址
+       sonarqubeUrl="http://sonarqube.tcsa.cloud"
+   }
+
+//流水线的阶段
+stages{
+    //阶段1 获取Build用户信息
+    stage('Get Build user info') {
+       steps {
+               // Get build user profile via User Build Vrs plugin
+               // https://wiki.jenkins.io/display/JENKINS/Build+User+Vars+Plugin
+               wrap([$class: 'BuildUser']) {
+                   script {
+                       BUILD_USER_ID = "${env.BUILD_USER_ID}"
+                       BUILD_USER = "${env.BUILD_USER}"
+                       BUILD_USER_EMAIL = "${env.BUILD_USER_EMAIL}"
+                   }
+				}
+				// output variable
+				//echo "Build User ID: ${BUILD_USER_ID}"
+				echo "Build User: ${BUILD_USER}"
+				//echo "Build User Email: ${BUILD_USER_EMAIL}"
+        }
+    }
+
+    //阶段2 获取代码
+    stage("CheckOut"){
+        steps{
+            script{
+
+                   println("${branchName}")
+                   
+                   tools.PrintMes("获取代码","green")
+                   println("${imageTag}")
+
+                 checkout([$class: 'GitSCM', branches: [[name: "${branchName}"]],
+                                        doGenerateSubmoduleConfigurations: false,
+                                        extensions: [],
+                                        submoduleCfg: [],
+                                        userRemoteConfigs: [[credentialsId: 'b11cf370-1b0b-4541-86aa-5fdb352d0217', url: "${srcUrl}"]]])
+                                
+            }
+        }
+    }
+    //阶段3 Build
+   stage("Build"){
+        steps{
+           script{
+                   tools.PrintMes("执行打包","green")
+                   sh label: '', script: '''
+                    export NODE_HOME=/home/jenkins/workspace/build/node-v14.15.1-linux-x64
+                    export PATH=$PATH:$NODE_HOME/bin:/home/jenkins/workspace/build/yarn-v1.12.0/bin
+                    yarn config set cache-folder "/home/jenkins/workspace/build/yarn-v1.12.0/cache"
+                    yarn 
+                    yarn build'''
+                 
+            }
+        }
+    } 
+
+    //阶段4 sonarqube代码质量扫描
+    stage("sonar"){
+        steps{
+            script{
+                tools.PrintMes("代码扫描","green")
+                sonar.SonarScan("${sonarName}","${sonarName}")
+                sleep 20
+                
+            }
+        }
+    }
+    //阶段5 阈值逻辑处理
+    stage("阈值逻辑处理"){
+        steps{
+            script{
+                tools.PrintMes("阈值逻辑处理","green")
+              //sonarqube逻辑处理
+				sh label: '', script: '''JQ_EXEC=`which jq`
+				FILE_PATH=sonarquberejson
+				Report=sonarqubereport
+				QA_http_api="${QA_http_url}"
+				QA_name="${QA_name}"
+				bugsValue=${bugs_Value}
+				smellsValue=${smells_Value}
+				vulnerabilitiesValue=${vulnerabilities_Value}
+				duplicatedValue=${duplicated_Value}
+				
+				/usr/bin/curl -u admin:sonarqube@loginOK  "${QA_http_api}/measures/component?componentKey=${QA_name}&metricKeys=alert_status%2Ccode_smells%2Cbugs%2Cvulnerabilities%2Cduplicated_lines_density"  > $FILE_PATH
+				data01=$(cat $FILE_PATH | ${JQ_EXEC} .component.measures[0] | sed \'s/\\"//g\')
+				data02=$(cat $FILE_PATH | ${JQ_EXEC} .component.measures[1] | sed \'s/\\"//g\')
+				data03=$(cat $FILE_PATH | ${JQ_EXEC} .component.measures[2] | sed \'s/\\"//g\')
+				data04=$(cat $FILE_PATH | ${JQ_EXEC} .component.measures[3] | sed \'s/\\"//g\')
+				data05=$(cat $FILE_PATH | ${JQ_EXEC} .component.measures[4] | sed \'s/\\"//g\')
+				cat /dev/null > $Report
+				echo $data01  >> $Report
+				echo $data02  >> $Report
+				echo $data03  >> $Report
+				echo $data04  >> $Report
+				echo $data05  >> $Report
+				smells=`grep code_smells $Report |awk   \'{print $5}\' |awk -F [,] \'{print $1}\'`
+				bugs=`grep bugs $Report |awk   \'{print $5}\' |awk -F [,] \'{print $1}\'`
+				vulnerabilities=`grep vulnerabilities $Report |awk   \'{print $5}\' |awk -F [,] \'{print $1}\'`
+				duplicated=`grep duplicated_lines_density $Report |awk   \'{print $5}\' |awk -F [,] \'{print $1}\'|awk -F\'[.]\' \'{print $1}\'`
+				echo null > smellsReport
+                echo null > bugsReport
+                echo null > vulnerabilitiesReport
+                echo null > duplicatedReport
+				########异味检测########
+				if [ ${smells} -le ${smellsValue} ]
+				then
+				echo -e "\\\\033[1;32m>>>>>>>>>>异味检测通过>>>>>>>>>>\\\\033[0m"
+				echo "${smells}"  > smellsReport
+				date
+				else
+				echo -e "\\\\033[1;31m>>>>>>>>>>异味检测不通过>>>>>>>>>>\\\\033[0m"
+				echo "${smells} 不达标，构建终止。"  >  smellsReport
+				date
+				exit 9
+				fi
+				########BUG检测########
+				if [ ${bugs} -le ${bugsValue} ]
+				then
+				echo -e "\\\\033[1;32m>>>>>>>>>>BUG检测通过>>>>>>>>>>\\\\033[0m"
+				echo "${bugs}"  > bugsReport
+				date
+				else
+				echo -e "\\\\033[1;31m>>>>>>>>>>BUG检测不通过>>>>>>>>>>\\\\033[0m"
+				echo "${bugs} 不达标，构建终止。"  >  bugsReport
+				date
+				exit 9
+				fi
+				########漏洞检测########
+				if [ ${vulnerabilities} -le ${vulnerabilitiesValue} ]
+				then
+				echo -e "\\\\033[1;32m>>>>>>>>>>漏洞检测通过>>>>>>>>>>\\\\033[0m"
+				echo "${vulnerabilities}"  > vulnerabilitiesReport
+				date
+				else
+				echo -e "\\\\033[1;31m>>>>>>>>>>漏洞检测不通过>>>>>>>>>>\\\\033[0m"
+				echo "${vulnerabilities} 不达标，构建终止。"  >  vulnerabilitiesReport
+				date
+				exit 9
+				fi
+				########重复率检测########
+				if [ ${duplicated} -le ${duplicatedValue} ]
+				then
+				echo -e "\\\\033[1;32m>>>>>>>>>>重复率检测通过>>>>>>>>>>\\\\033[0m"
+				echo "${duplicated}%"  > duplicatedReport
+				date
+				else
+				echo -e "\\\\033[1;31m>>>>>>>>>>重复率检测不通过>>>>>>>>>>\\\\033[0m"
+				echo "${duplicated}% 不达标，构建终止。"  >  duplicatedReport
+				date
+				exit 9
+				fi''' 
+				
+            }
+        }
+    }
+
+   stage("打包镜像"){
+            steps{
+                script{
+				tools.PrintMes("打包镜像","green")
+			    sh label: '', script: 'docker build -t registry.cn-shenzhen.aliyuncs.com/training2020/training-front-develop-admin:${imageTag} . '
+                }
+            }
+        }
+
+   stage("上传镜像"){
+            steps{
+                script{
+				tools.PrintMes("上传镜像","green")
+			    sh label: '', script: '''docker login --username=1000ecity --password=aliDocker@tcsa2020  registry.cn-shenzhen.aliyuncs.com
+                     docker push registry.cn-shenzhen.aliyuncs.com/training2020/training-front-develop-admin:${imageTag}'''
+                }
+            }
+    }
+
+
+    
+
+    
+    //阶段7 自动发布
+    stage("自动发布"){
+        
+            steps{
+                script{
+                 tools.PrintMes("自动发布","green")
+sh label: '', script: '''cat > admin.yaml  <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: training-front-develop-admin
+  namespace: develop
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: training-front-develop-admin
+  template:
+    metadata:
+      labels:
+        app: training-front-develop-admin
+    spec:
+      containers:
+      - image: registry.cn-shenzhen.aliyuncs.com/training2020/training-front-develop-admin:${imageTag}
+        imagePullPolicy: IfNotPresent
+        name: training-front-develop-admin
+        ports:
+        - containerPort: 80
+          name: web
+          protocol: TCP
+        resources:
+          limits:
+            cpu: "1"
+            memory: 1Gi
+          requests:
+            cpu: 500m
+            memory: 512Mi
+EOF
+'''
+                sh label: '', script: 'kubectl apply -f admin.yaml'
+              }
+           }
+    }
+    
+    
+    
+    
+}
+//阶段8 构建结束后做的事情
+post {
+    always{
+        script{
+            tools.PrintMes("获取邮件信息","green")
+           //异味	
+			smellsValue = sh returnStdout: true ,script: "cat smellsReport"
+            String smellsValue  = smellsValue.trim()
+            println("${smellsValue}")
+			
+			//BUG	
+			bugsValue = sh returnStdout: true ,script: "cat bugsReport"
+            String bugsValue  = bugsValue.trim()
+            println("${bugsValue}")
+			
+			//漏洞
+			vulnerabilitiesValue = sh returnStdout: true ,script: "cat vulnerabilitiesReport"
+            String vulnerabilitiesValue  = vulnerabilitiesValue.trim()
+            println("${vulnerabilitiesValue}")
+			
+			//重复率
+			duplicatedValue = sh returnStdout: true ,script: "cat duplicatedReport"
+            String duplicatedValue  = duplicatedValue.trim()
+            println("${duplicatedValue}")
+            
+            tools.PrintMes("清理工作目录","green")
+            //deleteDir()
+            //sh label: '', script: '/bin/rm  -rf  admin'
+            
+           
+        }
+    }
+        
+    success{
+        script{
+             tools.PrintMes("流水线构建成功","green")
+             toemail.Email("流水线构建成功","${emailUserList}","${BUILD_USER}","${smellsValue}","${bugsValue}","${vulnerabilitiesValue}","${duplicatedValue}","${sonarqubeUrl}","${imageTag}")
+        }
+        
+    }
+    failure{
+        script{
+            tools.PrintMes("流水线构建失败","red")
+            toemail.Email("流水线构建失败","${emailUserList}","${BUILD_USER}","${smellsValue}","${bugsValue}","${vulnerabilitiesValue}","${duplicatedValue}","${sonarqubeUrl}","${imageTag}")
+        }
+    }
+        
+    aborted{
+        script{
+            tools.PrintMes("流水线构建取消","red")
+            toemail.Email("流水线构建取消了","${emailUserList}","${BUILD_USER}","${smellsValue}","${bugsValue}","${vulnerabilitiesValue}","${duplicatedValue}","${sonarqubeUrl}","${imageTag}")
+        }
+        
+    }
+}
+}
